@@ -1,1 +1,1 @@
-conda run -n bark_tinkering jupyter notebook
+call conda run --no-capture-output -n bark_tinkering jupyter notebook
