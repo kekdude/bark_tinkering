@@ -10,7 +10,7 @@ from transformers.models.bark.generation_configuration_bark import BarkSemanticG
     BarkCoarseGenerationConfig
 
 from bark_tinkering.utils import bark_generate, wav_to_coarse_ids, audio_to_wav, get_models_devices, set_model_devices, \
-    SEMANTIC_MODEL, COARSE_MODEL, FINE_MODEL, CODEC_MODEL, save_playlist
+    SEMANTIC_MODEL, COARSE_MODEL, FINE_MODEL, CODEC_MODEL, save_playlist, save_generation_result, BarkGenerationResult
 import torch.nn.functional as F
 import numpy as np
 from tqdm import tqdm
@@ -170,7 +170,8 @@ def find_semantics_by_wav(model: BarkModel,
             with torch.no_grad():
                 save_path = output_folder / f'step_{step}'
                 adversarial_semantic_ids = parameters.argmax(dim=-1)#F.gumbel_softmax(parameters, hard=True, dim=-1).argmax(dim=-1)
-                bark_generate(model, from_semantic=adversarial_semantic_ids, save_as=save_path)
+                generations = bark_generate(model, from_semantic=adversarial_semantic_ids)
+                save_generation_result(model, generations[0], save_path)
                 torch.save(parameters, save_path / 'adversarial_semantic_parameters.pt')
                 playlist.append(str(pathlib.Path(save_path / 'audio.wav').relative_to(playlist_path.parent)))
                 save_playlist(playlist, playlist_path)
@@ -239,4 +240,21 @@ def create_voice_preset(model: BarkModel,
         SEMANTIC_PROMPT: semantic.numpy(),
         COARSE_PROMPT: coarse_prompt.numpy(),
         FINE_PROMPT: fine_prompt.numpy()
+    }
+
+
+def create_voice_preset_from_generation(generation: BarkGenerationResult):
+    semantic = generation.semantic_output.squeeze(0).cpu().numpy()
+    coarse = generation.coarse_output
+    fine = generation.fine_output.squeeze(0).cpu().numpy()
+
+    coarse = torch.vstack([
+        coarse[:, 0::2] - 10000,
+        coarse[:, 1::2] - 11024
+    ]).cpu().numpy()
+
+    return {
+        SEMANTIC_PROMPT: semantic,
+        COARSE_PROMPT: coarse,
+        FINE_PROMPT: fine
     }

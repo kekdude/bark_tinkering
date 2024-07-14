@@ -1,13 +1,14 @@
 name: bark_tinkering
 dependencies:
-- python=3.11.8
+- python=3.12.4
 - pip
 - pip:
   - --extra-index-url https://download.pytorch.org/whl/cu121
   - torch==2.3.1
   - torchaudio==2.3.1
   - numpy==1.26.4
-  - scipy
+  - scipy==1.14.0
+  - optimum==1.21.2
   - transformers==4.41.2
   - encodec==0.1.1
   - notebook==7.2.1

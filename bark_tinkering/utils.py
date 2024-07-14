@@ -1,6 +1,7 @@
+import dataclasses
 import pathlib
 from os import PathLike
-from typing import Optional, Dict, Union, Tuple, List
+from typing import Optional, Dict, Union, List
 
 import numpy as np
 import torch
@@ -10,6 +11,9 @@ from torch import Tensor
 from transformers import BarkModel, BarkProcessor
 from transformers.models.bark.generation_configuration_bark import BarkSemanticGenerationConfig, \
     BarkCoarseGenerationConfig, BarkFineGenerationConfig
+import itertools
+import warnings
+
 
 SEMANTIC_MODEL = "semantic"
 COARSE_MODEL = "coarse_acoustics"
@@ -17,17 +21,24 @@ FINE_MODEL = "fine_acoustics"
 CODEC_MODEL = "codec_model"
 
 
+@dataclasses.dataclass
+class BarkGenerationResult:
+    audio: Tensor
+    semantic_output: torch.LongTensor
+    coarse_output: torch.LongTensor
+    fine_output: torch.LongTensor
+
+
 @torch.no_grad()
 def bark_generate(
         model: BarkModel,
         input_ids: Optional[torch.Tensor] = None,
         history_prompt: Optional[Dict[str, torch.Tensor]] = None,
-        return_output_lengths: Optional[bool] = None,
-        save_as: Optional[str | PathLike] = None,
         from_semantic: Optional[torch.Tensor] = None,
         from_coarse: Optional[torch.Tensor] = None,
+        save_as=42,
         **kwargs,
-) -> Union[Tuple[Tensor, List[int]], torch.LongTensor]:
+) -> List[BarkGenerationResult]:
     """
             Extended version of `BarkModel.generate` with option to save generation results, incuding generated semantic,
             coarse and fine models outputs.
@@ -46,14 +57,10 @@ def bark_generate(
                     semantic, coarse and fine respectively. It has the priority over the keywords without a prefix.
 
                     This means you can, for example, specify a generation strategy for all sub-models except one.
-                return_output_lengths (`bool`, *optional*):
-                    Whether or not to return the waveform lengths. Useful when batching.
-                save_as (`Optional[str | PathLike]`, *optional*):
-                    Path to save generation results.
                 from_semantic (`Optional[torch.Tensor]`, *optional*):
                     Output of semantic model to start generation from. If passed, semantic generation will be skipped.
                 from_coarse (`Optional[torch.Tensor]`, *optional*):
-                    Output of coarse model to start generation from. If passed, semantic and coarse generation will be
+                    Output of coarse model to start generation from. If passed, semantic and coarse generations will be
                     skipped.
             Returns:
                 By default:
@@ -84,6 +91,9 @@ def bark_generate(
     semantic_generation_config = BarkSemanticGenerationConfig(**model.generation_config.semantic_config)
     coarse_generation_config = BarkCoarseGenerationConfig(**model.generation_config.coarse_acoustics_config)
     fine_generation_config = BarkFineGenerationConfig(**model.generation_config.fine_acoustics_config)
+
+    return_output_lengths = True
+    kwargs.pop("return_output_lengths", None)
 
     kwargs_semantic = {
         # if "attention_mask" is set, it should not be passed to CoarseModel and FineModel
@@ -140,11 +150,9 @@ def bark_generate(
             **kwargs_coarse,
         )
 
-    output_lengths = None
-    if return_output_lengths:
-        coarse_output, output_lengths = coarse_output
-        # (batch_size, seq_len*coarse_codebooks) -> (batch_size, seq_len)
-        output_lengths = output_lengths // coarse_generation_config.n_coarse_codebooks
+    coarse_output, output_lengths = coarse_output
+    # (batch_size, seq_len*coarse_codebooks) -> (batch_size, seq_len)
+    output_lengths = output_lengths // coarse_generation_config.n_coarse_codebooks
 
     # 3. "generate" from the fine model
     output = model.fine_acoustics.generate(
@@ -171,23 +179,35 @@ def bark_generate(
         # Offload codec_model to CPU
         model.codec_model_hook.offload()
 
-    if return_output_lengths:
-        output_lengths = [len(sample) for sample in audio]
-        audio = torch.nn.utils.rnn.pad_sequence(audio, batch_first=True, padding_value=0)
-        return audio, output_lengths
+    batch_size = semantic_output.size(0) if semantic_output is not None else coarse_output.size(0)
+    result = []
+    for batch_idx in range(batch_size):
+        result.append(BarkGenerationResult(audio=audio[batch_idx],
+                                           semantic_output=semantic_output[batch_idx:batch_idx+1, semantic_output[batch_idx] != coarse_generation_config.coarse_semantic_pad_token],
+                                           coarse_output=coarse_output[batch_idx:batch_idx+1, :output_lengths[batch_idx] * coarse_generation_config.n_coarse_codebooks],
+                                           fine_output=output[batch_idx:batch_idx+1, :, :output_lengths[batch_idx]]))
 
-    if save_as is not None:
-        base_save_path = pathlib.Path(save_as)
-        base_save_path.mkdir(parents=True, exist_ok=True)
-        torch.save(semantic_output, base_save_path.joinpath('semantic.pt'))
-        torch.save(coarse_output, base_save_path.joinpath('coarse.pt'))
-        coarse_ids_to_wav(model, coarse_output, base_save_path.joinpath('coarse.wav'),
-                          sample_rate=model.generation_config.sample_rate)
-        torch.save(output, base_save_path.joinpath('fine.pt'))
-        torch.save(audio, base_save_path.joinpath('audio.pt'))
-        audio_to_wav(audio, base_save_path.joinpath('audio.wav'), model.generation_config.sample_rate)
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
-    return audio
+    return result
+
+
+def save_audio_from_generation(model, generation: BarkGenerationResult, save_path: str | PathLike):
+    save_path = pathlib.Path(save_path)
+    audio_to_wav(generation.audio, save_path, model.generation_config.sample_rate)
+
+
+def save_generation_result(model: BarkModel, generation: BarkGenerationResult, save_path: str | PathLike):
+    save_path = pathlib.Path(save_path)
+    save_path.mkdir(parents=True, exist_ok=True)
+    torch.save(generation.semantic_output, save_path / 'semantic.pt')
+    torch.save(generation.coarse_output, save_path / 'coarse.pt')
+    coarse_ids_to_wav(model, generation.coarse_output, save_path / 'coarse.wav',
+                      sample_rate=model.generation_config.sample_rate)
+    torch.save(generation.fine_output, save_path / 'fine.pt')
+    torch.save(generation.audio, save_path / 'audio.pt')
+    audio_to_wav(generation.audio, save_path / 'audio.wav', model.generation_config.sample_rate)
 
 
 def audio_to_wav(audio, filename: Union[str, PathLike], sample_rate=16000):
@@ -202,6 +222,11 @@ def coarse_ids_to_wav(model: BarkModel, coarse_output: torch.LongTensor, filenam
     idx = torch.arange(coarse_output.size(-1))
     channel0 = coarse_output[:, idx % 2 == 0] - 10000
     channel1 = coarse_output[:, idx % 2 == 1] - 11024
+    if coarse_output.size(-1) % 2 != 0:
+        truncated_size = min(channel0.size(-1), channel1.size(-1))
+        channel0 = channel0[:, :truncated_size]
+        channel1 = channel1[:, :truncated_size]
+        warnings.warn('coarse channels had different lengths and were truncated')
     channels = torch.vstack([channel0, channel1])
     channels = channels.unsqueeze(1)
     emb = model.codec_model.quantizer.decode(channels)
@@ -230,22 +255,27 @@ def wav_to_coarse_ids(model: BarkModel, filename: Union[str, PathLike]):
     return coarse
 
 
-def make_text_generations(model: BarkModel, processor: BarkProcessor, texts: List[str], base_folder: PathLike | str, voice_preset=None, min_eos_p=0.05):
+def make_text_generations(model: BarkModel, processor: BarkProcessor, texts: List[str], base_folder: PathLike | str, voice_preset=None, min_eos_p=0.05, batch_size=None, **kwargs):
     base_folder = pathlib.Path(base_folder)
     pathlib.Path(base_folder).mkdir(parents=True, exist_ok=True)
-    sample_ids = list(f'{i}' for i in range(len(texts)))
     playlist_filename = f'{base_folder}/all.m3u'
     playlist = []
-    for text, sample_id in zip(texts, sample_ids):
-        sample_dir = base_folder / str(sample_id)
-        text_file = sample_dir / "text.txt"
-        inputs = processor(text, voice_preset=voice_preset)
+    sample_id = 0
+    batch_size = batch_size if batch_size is not None else len(texts)
+
+    for texts_batch in itertools.batched(texts, batch_size):
+        inputs = processor(texts_batch, voice_preset=voice_preset)
         inputs = inputs.to(model.device)
-        bark_generate(model, **inputs, save_as=sample_dir, min_eos_p=min_eos_p)
-        text_file.write_text(text)
-        playlist.append(f'{sample_id}/audio.wav')
-        save_playlist(playlist, playlist_filename)
-        print(f'Generated {sample_id}')
+        generations = bark_generate(model, **inputs, min_eos_p=min_eos_p, **kwargs)
+        for text, generation in zip(texts_batch, generations):
+            sample_dir = base_folder / str(sample_id)
+            save_generation_result(model, generation, sample_dir)
+            text_file = sample_dir / "text.txt"
+            text_file.write_text(text)
+            playlist.append(f'{sample_id}/audio.wav')
+            save_playlist(playlist, playlist_filename)
+            print(f'Generated {sample_id}')
+            sample_id += 1
 
 
 def read_playlist(path: Union[str, PathLike]) -> List[str]:
@@ -270,6 +300,7 @@ def get_models_devices(model: BarkModel) -> Dict:
         FINE_MODEL: model.fine_acoustics.device,
         CODEC_MODEL: model.codec_model.device
     }
+
 
 def set_model_devices(model: BarkModel, model_devices: Dict) -> None:
     model.semantic = model.semantic.to(model_devices[SEMANTIC_MODEL])

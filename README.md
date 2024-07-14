@@ -10,6 +10,12 @@ You will need some kind of conda to run it. You can install miniconda from [here
 * Run `start.sh` on Linux
 * Run `start.bat` on Windows
 
+Notebooks:
+
+* lina - creating a speaker by audio sample
+* optimized_generation - how to generate optimally and use utils
+* going_emotional - approach on emotions
+
 Check lina.ipynb for example
 
 ## How it works?
